@@ -233,10 +233,12 @@ impl AttestationDocument {
         let nonce: Option<Vec<u8>> =
             match document_map.get(&serde_cbor::Value::Text("nonce".to_string())) {
                 Some(serde_cbor::Value::Bytes(val)) => Some(val.to_vec()),
-                None => None,
-                v => return Err(format!(
+                None | Some(serde_cbor::Value::Null) => None,
+                v => {
+                    return Err(format!(
                     "AttestationDocument::parse_payload nonce is wrong type or not present: {v:?}"
-                )),
+                ))
+                }
             };
 
         let user_data: Option<Vec<u8>> =
