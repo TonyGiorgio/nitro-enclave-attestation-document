@@ -9,6 +9,8 @@
 //! See the `LICENSE.markdown` file in the repo for
 //! information on licensing and copyright.
 
+use aws_nitro_enclaves_cose::crypto::Openssl;
+use openssl::pkey::PKey;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 
@@ -29,26 +31,14 @@ pub struct AttestationDocument {
 }
 
 impl AttestationDocument {
-    pub fn authenticate(
-        document_data: &[u8],
-        trusted_root_cert: &[u8],
-    ) -> Result<Self, String> {
+    pub fn authenticate(document_data: &[u8], trusted_root_cert: &[u8]) -> Result<Self, String> {
         // Following the steps here: https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html
         // Step 1. Decode the CBOR object and map it to a COSE_Sign1 structure
-        let (_protected, payload, _signature) =
-            AttestationDocument::parse(document_data).map_err(|err| {
-                format!(
-                    "AttestationDocument::authenticate parse failed:{:?}",
-                    err
-                )
-            })?;
+        let (_protected, payload, _signature) = AttestationDocument::parse(document_data)
+            .map_err(|err| format!("AttestationDocument::authenticate parse failed:{:?}", err))?;
         // Step 2. Exract the attestation document from the COSE_Sign1 structure
-        let document = AttestationDocument::parse_payload(&payload).map_err(|err| {
-            format!(
-                "AttestationDocument::authenticate failed:{:?}",
-                err
-            )
-        })?;
+        let document = AttestationDocument::parse_payload(&payload)
+            .map_err(|err| format!("AttestationDocument::authenticate failed:{:?}", err))?;
 
         // Step 3. Verify the certificate's chain
         let mut certs: Vec<rustls::Certificate> = Vec::new();
@@ -70,17 +60,23 @@ impl AttestationDocument {
             })?;
 
         let verifier = rustls::server::AllowAnyAuthenticatedClient::new(root_store);
-        let _verified = verifier.verify_client_cert(&rustls::Certificate(document.certificate.clone()), &certs, std::time::SystemTime::now()).map_err(|err| {
-            format!(
-                "AttestationDocument::authenticate verify_client_cert failed:{:?}",
-                err
+        let _verified = verifier
+            .verify_client_cert(
+                &rustls::Certificate(document.certificate.clone()),
+                &certs,
+                std::time::SystemTime::now(),
             )
-        })?;
+            .map_err(|err| {
+                format!(
+                    "AttestationDocument::authenticate verify_client_cert failed:{:?}",
+                    err
+                )
+            })?;
         // if verify_client_cert didn't generate an error, authentication passed
 
         // Step 4. Ensure the attestation document is properly signed
         let authenticated = {
-            let sig_structure = aws_nitro_enclaves_cose::sign::COSESign1::from_bytes(document_data)
+            let sig_structure = aws_nitro_enclaves_cose::sign::CoseSign1::from_bytes(document_data)
                 .map_err(|err| {
                     format!("AttestationDocument::authenticate failed to load document_data as COSESign1 structure:{:?}", err)
                 })?;
@@ -98,7 +94,8 @@ impl AttestationDocument {
                     err
                 )
             })?;
-            let result = sig_structure.verify_signature(&pub_ec_key)
+            let pkey = PKey::from_ec_key(pub_ec_key).unwrap();
+            let result = sig_structure.verify_signature::<Openssl>(&pkey)
                 .map_err(|err| {
                     format!("AttestationDocument::authenticate failed to verify signature on sig_structure:{:?}", err)
                 })?;
@@ -114,19 +111,11 @@ impl AttestationDocument {
     }
 
     fn parse(document_data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-        let cbor: serde_cbor::Value =
-            serde_cbor::from_slice(document_data).map_err(|err| {
-                format!(
-                    "AttestationDocument::parse from_slice failed:{:?}",
-                    err
-                )
-            })?;
+        let cbor: serde_cbor::Value = serde_cbor::from_slice(document_data)
+            .map_err(|err| format!("AttestationDocument::parse from_slice failed:{:?}", err))?;
         let elements = match cbor {
             serde_cbor::Value::Array(elements) => elements,
-            _ => panic!(
-                "AttestationDocument::parse Unknown field cbor:{:?}",
-                cbor
-            ),
+            _ => panic!("AttestationDocument::parse Unknown field cbor:{:?}", cbor),
         };
         let protected = match &elements[0] {
             serde_cbor::Value::Bytes(prot) => prot,
@@ -165,21 +154,40 @@ impl AttestationDocument {
 
         let document_map: BTreeMap<serde_cbor::Value, serde_cbor::Value> = match document_data {
             serde_cbor::Value::Map(map) => map,
-            _ => return Err(format!("AttestationDocument::parse_payload field ain't what it should be:{:?}", document_data)),
+            _ => {
+                return Err(format!(
+                    "AttestationDocument::parse_payload field ain't what it should be:{:?}",
+                    document_data
+                ))
+            }
         };
 
-        let module_id: String = match document_map.get(&serde_cbor::Value::Text("module_id".to_string())) {
-            Some(serde_cbor::Value::Text(val)) => val.to_string(),
-            _ => return Err(format!("AttestationDocument::parse_payload module_id is wrong type or not present")),
-        };
+        let module_id: String =
+            match document_map.get(&serde_cbor::Value::Text("module_id".to_string())) {
+                Some(serde_cbor::Value::Text(val)) => val.to_string(),
+                _ => {
+                    return Err(format!(
+                        "AttestationDocument::parse_payload module_id is wrong type or not present"
+                    ))
+                }
+            };
 
-        let timestamp: i128 = match document_map.get(&serde_cbor::Value::Text("timestamp".to_string())) {
-            Some(serde_cbor::Value::Integer(val)) => *val,
-            _ => return Err(format!("AttestationDocument::parse_payload timestamp is wrong type or not present")),
-        };
+        let timestamp: i128 =
+            match document_map.get(&serde_cbor::Value::Text("timestamp".to_string())) {
+                Some(serde_cbor::Value::Integer(val)) => *val,
+                _ => {
+                    return Err(format!(
+                        "AttestationDocument::parse_payload timestamp is wrong type or not present"
+                    ))
+                }
+            };
 
-        let timestamp: u64 = timestamp.try_into()
-            .map_err(|err| format!("AttestationDocument::parse_payload failed to convert timestamp to u64:{:?}", err))?;
+        let timestamp: u64 = timestamp.try_into().map_err(|err| {
+            format!(
+                "AttestationDocument::parse_payload failed to convert timestamp to u64:{:?}",
+                err
+            )
+        })?;
 
         let public_key: Option<Vec<u8>> =
             match document_map.get(&serde_cbor::Value::Text("public_key".to_string())) {
@@ -188,10 +196,15 @@ impl AttestationDocument {
                 None => None,
             };
 
-        let certificate: Vec<u8> = match document_map.get(&serde_cbor::Value::Text("certificate".to_string())) {
-            Some(serde_cbor::Value::Bytes(val)) => val.to_vec(),
-            _ => return Err(format!("AttestationDocument::parse_payload certificate is wrong type or not present")),
-        };
+        let certificate: Vec<u8> =
+            match document_map.get(&serde_cbor::Value::Text("certificate".to_string())) {
+                Some(serde_cbor::Value::Bytes(val)) => val.to_vec(),
+                _ => {
+                    return Err(format!(
+                    "AttestationDocument::parse_payload certificate is wrong type or not present"
+                ))
+                }
+            };
 
         let pcrs: Vec<Vec<u8>> = match document_map
             .get(&serde_cbor::Value::Text("pcrs".to_string()))
@@ -210,16 +223,23 @@ impl AttestationDocument {
                 }
                 ret_vec
             }
-            _ => return Err(format!(
-                "AttestationDocument::parse_payload pcrs is wrong type or not present"
-            )),
+            _ => {
+                return Err(format!(
+                    "AttestationDocument::parse_payload pcrs is wrong type or not present"
+                ))
+            }
         };
 
-        let nonce: Option<Vec<u8>> = match document_map.get(&serde_cbor::Value::Text("nonce".to_string())) {
-            Some(serde_cbor::Value::Bytes(val)) => Some(val.to_vec()),
-            None => None,
-            _ => return Err(format!("AttestationDocument::parse_payload nonce is wrong type or not present")),
-         };
+        let nonce: Option<Vec<u8>> =
+            match document_map.get(&serde_cbor::Value::Text("nonce".to_string())) {
+                Some(serde_cbor::Value::Bytes(val)) => Some(val.to_vec()),
+                None => None,
+                _ => {
+                    return Err(format!(
+                        "AttestationDocument::parse_payload nonce is wrong type or not present"
+                    ))
+                }
+            };
 
         let user_data: Option<Vec<u8>> =
             match document_map.get(&serde_cbor::Value::Text("user_data".to_string())) {
@@ -228,26 +248,41 @@ impl AttestationDocument {
                 Some(_null) => None,
             };
 
-        let digest: String = match document_map.get(&serde_cbor::Value::Text("digest".to_string())) {
+        let digest: String = match document_map.get(&serde_cbor::Value::Text("digest".to_string()))
+        {
             Some(serde_cbor::Value::Text(val)) => val.to_string(),
-            _ => return Err(format!("AttestationDocument::parse_payload digest is wrong type or not present")),
+            _ => {
+                return Err(format!(
+                    "AttestationDocument::parse_payload digest is wrong type or not present"
+                ))
+            }
         };
 
-        let cabundle: Vec<Vec<u8>> = match document_map.get(&serde_cbor::Value::Text("cabundle".to_string())) {
-            Some(serde_cbor::Value::Array(outer_vec)) => {
-                let mut ret_vec: Vec<Vec<u8>> = Vec::new();
-                for this_vec in outer_vec.iter() {
-                    match this_vec {
-                        serde_cbor::Value::Bytes(inner_vec) => {
-                            ret_vec.push(inner_vec.to_vec());
-                        },
-                        _ => return Err(format!("AttestationDocument::parse_payload inner_vec is wrong type")),
+        let cabundle: Vec<Vec<u8>> =
+            match document_map.get(&serde_cbor::Value::Text("cabundle".to_string())) {
+                Some(serde_cbor::Value::Array(outer_vec)) => {
+                    let mut ret_vec: Vec<Vec<u8>> = Vec::new();
+                    for this_vec in outer_vec.iter() {
+                        match this_vec {
+                            serde_cbor::Value::Bytes(inner_vec) => {
+                                ret_vec.push(inner_vec.to_vec());
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "AttestationDocument::parse_payload inner_vec is wrong type"
+                                ))
+                            }
+                        }
                     }
+                    ret_vec
                 }
-                ret_vec
-            },
-            _ => return Err(format!("AttestationDocument::parse_payload cabundle is wrong type or not present:{:?}", document_map.get(&serde_cbor::Value::Text("cabundle".to_string())))),
-        };
+                _ => {
+                    return Err(format!(
+                    "AttestationDocument::parse_payload cabundle is wrong type or not present:{:?}",
+                    document_map.get(&serde_cbor::Value::Text("cabundle".to_string()))
+                ))
+                }
+            };
 
         Ok(AttestationDocument {
             module_id: module_id,
